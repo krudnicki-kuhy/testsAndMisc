@@ -5,13 +5,14 @@
 #include <jpeglib.h>
 #include <sys/stat.h>
 #include <errno.h>
+#include <unistd.h>
 
 typedef struct {
     unsigned char r, g, b;
 } RGB;
 
 void print_usage(const char* program_name) {
-    printf("Usage: %s [options] <num_images> <size> <block_size> <quality> <output_path> <color1> ... <colorN>\n", program_name);
+    printf("Usage: %s [options] <num_images> <size> <block_size> <quality> <output_path> [custom_date] <color1> ... <colorN>\n", program_name);
     printf("Options:\n");
     printf("  -h, --help           Show this help message and exit\n");
     printf("Arguments:\n");
@@ -20,7 +21,43 @@ void print_usage(const char* program_name) {
     printf("  <block_size>         Size of each block (default: 25)\n");
     printf("  <quality>            Quality of the output image (default: 100)\n");
     printf("  <output_path>        Path to save the output image (default: output.png)\n");
+    printf("  [custom_date]        Custom date in YYYYMMDD format (optional, uses current date if not provided)\n");
     printf("  <color1> ... <colorN> List of colors in hex format (default: #000000 and #FFFFFF)\n");
+}
+
+int validate_and_parse_custom_date(const char* date_str, struct tm* custom_time) {
+    if (strlen(date_str) != 8) {
+        return 0; // Invalid length
+    }
+    
+    // Check if all characters are digits
+    for (int i = 0; i < 8; i++) {
+        if (date_str[i] < '0' || date_str[i] > '9') {
+            return 0; // Non-digit character found
+        }
+    }
+    
+    // Parse YYYYMMDD
+    int year, month, day;
+    if (sscanf(date_str, "%4d%2d%2d", &year, &month, &day) != 3) {
+        return 0; // Failed to parse
+    }
+    
+    // Basic validation
+    if (year < 1900 || year > 2100 || month < 1 || month > 12 || day < 1 || day > 31) {
+        return 0; // Invalid date values
+    }
+    
+    // Set up the tm structure
+    memset(custom_time, 0, sizeof(struct tm));
+    custom_time->tm_year = year - 1900; // tm_year is years since 1900
+    custom_time->tm_mon = month - 1;    // tm_mon is 0-11
+    custom_time->tm_mday = day;
+    custom_time->tm_hour = 12;          // Set to noon
+    custom_time->tm_min = 0;
+    custom_time->tm_sec = 0;
+    
+    return 1; // Success
 }
 
 void create_folder_if_not_exists(const char* folder) {
@@ -100,6 +137,25 @@ void finalize_compression(struct jpeg_compress_struct *cinfo, FILE *outfile) {
     jpeg_destroy_compress(cinfo);
 }
 
+void add_exif_datetime_batch(const char* folder, const char* datetime_str) {
+    // Use exiftool command to add EXIF DateTime fields to all images in folder
+    char command[1024];
+    snprintf(command, sizeof(command), 
+        "exiftool -overwrite_original -DateTimeOriginal='%s' -CreateDate='%s' -ModifyDate='%s' '%s'/*.jpg 2>/dev/null", 
+        datetime_str, datetime_str, datetime_str, folder);
+    
+    // Execute the command
+    int result = system(command);
+    if (result != 0) {
+        // If exiftool is not available, throw an error and exit
+        fprintf(stderr, "Error: exiftool is not available or failed to execute.\n");
+        fprintf(stderr, "Please install exiftool or run the setup script (run.sh) first.\n");
+        exit(EXIT_FAILURE);
+    }
+}
+
+
+
 void save_image_as_jpeg(unsigned char* image_buffer, int size, const char* unique_output_path, int quality) {
     struct jpeg_compress_struct cinfo;
     struct jpeg_error_mgr jerr;
@@ -150,14 +206,6 @@ void parse_single_color(const char* color_str, RGB* color) {
     *color = (RGB){ r, g, b };
 }
 
-void parse_color_list(int argc, char* argv[], int* num_colors, RGB** color_list) {
-    *num_colors = argc - 6;
-    allocate_color_list(*num_colors, color_list);
-    for (int i = 0; i < *num_colors; ++i) {
-        parse_single_color(argv[6 + i], &(*color_list)[i]);
-    }
-}
-
 void parse_default_colors(int* num_colors, RGB** color_list) {
     const char* default_colors[] = { "#000000", "#FFFFFF" };
     *num_colors = sizeof(default_colors) / sizeof(default_colors[0]);
@@ -167,27 +215,43 @@ void parse_default_colors(int* num_colors, RGB** color_list) {
     }
 }
 
-void parse_colors(int argc, char* argv[], int* num_colors, RGB** color_list) {
-    if (argc > 6) {
-        parse_color_list(argc, argv, num_colors, color_list);
+void parse_colors(int argc, char* argv[], int* num_colors, RGB** color_list, int has_custom_date) {
+    int color_start_index = has_custom_date ? 7 : 6;
+    if (argc > color_start_index) {
+        *num_colors = argc - color_start_index;
+        allocate_color_list(*num_colors, color_list);
+        for (int i = 0; i < *num_colors; ++i) {
+            parse_single_color(argv[color_start_index + i], &(*color_list)[i]);
+        }
     } else {
         parse_default_colors(num_colors, color_list);
     }
 }
 
-void parse_arguments(int argc, char* argv[], int* num_images, int* size, int* block_size, int* quality, const char** output_path) {
+void parse_arguments(int argc, char* argv[], int* num_images, int* size, int* block_size, int* quality, const char** output_path, const char** custom_date, int* has_custom_date) {
     // Default values
     *num_images = 1;
     *size = 1000;
     *block_size = 25;
     *quality = 100;
     *output_path = "output.png";
+    *custom_date = NULL;
+    *has_custom_date = 0;
 
     if (argc > 1) *num_images = atoi(argv[1]);
     if (argc > 2) *size = atoi(argv[2]);
     if (argc > 3) *block_size = atoi(argv[3]);
     if (argc > 4) *quality = atoi(argv[4]);
     if (argc > 5) *output_path = argv[5];
+    
+    // Check if 7th argument exists and looks like a date (8 digits)
+    if (argc > 6 && strlen(argv[6]) == 8) {
+        struct tm temp_time;
+        if (validate_and_parse_custom_date(argv[6], &temp_time)) {
+            *custom_date = argv[6];
+            *has_custom_date = 1;
+        }
+    }
 }
 
 void create_output_folder(char *folder, size_t folder_size) {
@@ -213,26 +277,48 @@ int main(int argc, char *argv[]) {
     // Start time measurement
     clock_t start_time = clock();
 
-    int num_images, size, block_size, quality;
-    const char *output_path;
-    parse_arguments(argc, argv, &num_images, &size, &block_size, &quality, &output_path);
+    int num_images, size, block_size, quality, has_custom_date;
+    const char *output_path, *custom_date;
+    parse_arguments(argc, argv, &num_images, &size, &block_size, &quality, &output_path, &custom_date, &has_custom_date);
 
     RGB *color_list;
     int num_colors;
-    parse_colors(argc, argv, &num_colors, &color_list);
+    parse_colors(argc, argv, &num_colors, &color_list, has_custom_date);
 
     char folder[64];
     create_output_folder(folder, sizeof(folder));
 
+    // Get datetime for EXIF data
+    char datetime_str[32];
+    if (has_custom_date) {
+        struct tm custom_time;
+        if (!validate_and_parse_custom_date(custom_date, &custom_time)) {
+            fprintf(stderr, "Invalid custom date format: %s. Please use YYYYMMDD format.\n", custom_date);
+            free(color_list);
+            exit(EXIT_FAILURE);
+        }
+        strftime(datetime_str, sizeof(datetime_str), "%Y:%m:%d %H:%M:%S", &custom_time);
+        printf("Using custom date: %s\n", datetime_str);
+    } else {
+        time_t now = time(NULL);
+        struct tm *local_time = localtime(&now);
+        strftime(datetime_str, sizeof(datetime_str), "%Y:%m:%d %H:%M:%S", local_time);
+    }
+
+    // Generate all images first (fast)
     for (int i = 1; i <= num_images; ++i) {
         generate_bloated_jpeg(size, color_list, num_colors, block_size, output_path, quality, i, folder);
     }
+
+    // Add EXIF data to all images in one batch (much faster than individual calls)
+    printf("Adding EXIF metadata to %d images...\n", num_images);
+    add_exif_datetime_batch(folder, datetime_str);
 
     free(color_list);
 
     // End time measurement
     clock_t end_time = clock();
     double execution_time = (double)(end_time - start_time) / CLOCKS_PER_SEC;
-    printf("Generated %d images in %f seconds!\n", num_images, execution_time);
+    printf("Generated %d images with EXIF data in %f seconds!\n", num_images, execution_time);
     return EXIT_SUCCESS;
 }
